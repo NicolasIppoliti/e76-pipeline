@@ -10,6 +10,14 @@ export function database(url: string): pg.Pool {
 }
 export function sha256(bytes: Buffer | string): string { return createHash('sha256').update(bytes).digest('hex'); }
 export function configHash(tenant: Tenant): string { return sha256(JSON.stringify(tenant)); }
+export async function assertWorkerIdentity(pool: pg.Pool, tenant: Tenant): Promise<void> {
+  const result = await pool.query('SELECT t.tenant_id,t.config_hash,r.rolsuper,r.rolbypassrls,r.rolcreaterole FROM pipeline.tenants t JOIN pg_roles r ON r.rolname=session_user WHERE t.role_name=session_user');
+  const identity = result.rows[0];
+  if (result.rowCount !== 1 || identity.tenant_id !== tenant.id || identity.config_hash !== configHash(tenant) || identity.rolsuper || identity.rolbypassrls || identity.rolcreaterole) {
+    throw new Error('Worker identity or config does not match a restricted provisioned tenant');
+  }
+}
+
 const identifier = (value: string) => `"${value.replaceAll('"', '""')}"`;
 const literal = (value: string) => `'${value.replaceAll("'", "''")}'`;
 

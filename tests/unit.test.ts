@@ -59,3 +59,12 @@ test('CSV quoting keeps original record evidence and exact money without floatin
   assert.equal((row.canonical as { gross: string }).gross, '999999999999.99');
   assert.equal(row.rawText, '"A,quoted",2026-01-06T00:00:00Z,email,999999999999.99,USD,a@example.invalid\r\n');
 });
+
+test('CLI help runs without database credentials and unknown arguments fail', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const help = spawnSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', '--help'], { encoding: 'utf8' });
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /db:setup/);
+  const invalid = spawnSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'ingest', '--bogus'], { encoding: 'utf8' });
+  assert.equal(invalid.status, 1);
+});
