@@ -1,0 +1,19 @@
+name: e76-pipeline
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: pipeline_admin
+      POSTGRES_PASSWORD: local-admin-only
+      POSTGRES_DB: pipeline
+    ports:
+      - '127.0.0.1:55476:5432'
+    volumes:
+      - pipeline-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U pipeline_admin -d pipeline']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+volumes:
+  pipeline-data:

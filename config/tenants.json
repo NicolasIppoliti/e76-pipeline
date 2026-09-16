@@ -1,0 +1,58 @@
+{
+  "tenants": [
+    {
+      "id": "northwind",
+      "role": "pipeline_northwind",
+      "databaseUrlEnv": "NORTHWIND_DATABASE_URL",
+      "channels": {
+        "facebook": "paid_social",
+        "google": "paid_search",
+        "email": "email",
+        "direct": "direct"
+      },
+      "platforms": {
+        "facebook": "meta",
+        "google": "google",
+        "email": "email"
+      },
+      "eventTypes": {
+        "open": "open",
+        "click": "click",
+        "unsubscribe": "unsubscribe",
+        "delivered": "delivered",
+        "bounce": "bounce",
+        "sent": "sent"
+      },
+      "orderCurrencies": [
+        "USD"
+      ]
+    },
+    {
+      "id": "lumen",
+      "role": "pipeline_lumen",
+      "databaseUrlEnv": "LUMEN_DATABASE_URL",
+      "channels": {
+        "Meta": "paid_social",
+        "Google": "paid_search",
+        "Newsletter": "email",
+        "Direct": "direct"
+      },
+      "platforms": {
+        "Meta": "meta",
+        "Google": "google",
+        "Newsletter": "email"
+      },
+      "eventTypes": {
+        "OPEN": "open",
+        "CLICK": "click",
+        "UNSUBSCRIBE": "unsubscribe",
+        "DELIVERED": "delivered",
+        "BOUNCE": "bounce",
+        "SENT": "sent"
+      },
+      "orderCurrencies": [
+        "EUR"
+      ]
+    }
+  ]
+}
