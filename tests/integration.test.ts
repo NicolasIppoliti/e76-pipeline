@@ -135,6 +135,52 @@ test('concurrent delivery serializes safely without duplicates', async () => {
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM pipeline.files')).rows[0].n, 1);
 });
 
+test('saturated worker pool journals every invalid ingest without masking validation errors', async () => {
+  const acquisitionTimeout = 750;
+  const worker = new pg.Pool({ connectionString: urls[northwind.databaseUrlEnv]!, max: 3,
+    connectionTimeoutMillis: acquisitionTimeout, application_name: 'e76-failure-journal-test' });
+  const holder = await admin.connect();
+  let pending: Promise<PromiseSettledResult<unknown>[]> | undefined;
+  try {
+    await holder.query('BEGIN');
+    await holder.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`e76-pipeline:${northwind.id}`]);
+    pending = Promise.allSettled([1, 2, 3].map(batch =>
+      ingestBytes(worker, northwind, fixtureBatch('orders', batch), Buffer.from('invalid\nvalue\n'))));
+    let waiting = 0;
+    try {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const state = await admin.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE application_name='e76-failure-journal-test' AND wait_event='advisory'");
+        waiting = state.rows[0].n;
+        if (waiting === 3) break;
+        await delay(5);
+      }
+      assert.equal(waiting, 3, 'all three transaction connections must be occupied before validation');
+    } finally { await holder.query('ROLLBACK'); }
+    const started = performance.now();
+    const results = await pending;
+    const elapsed = performance.now() - started;
+    const attempts = await worker.query('SELECT batch,status,error_message FROM pipeline.ingest_attempts ORDER BY batch');
+    assert.ok(elapsed < acquisitionTimeout, `failure journaling took ${elapsed.toFixed(0)}ms; acquisition timeout is ${acquisitionTimeout}ms`);
+    for (const result of results) {
+      assert.equal(result.status, 'rejected');
+      if (result.status === 'rejected') {
+        assert.ok(result.reason instanceof Error);
+        assert.match(result.reason.message, /Unsupported orders schema/);
+      }
+    }
+    assert.equal(attempts.rowCount, 3);
+    assert.deepEqual(attempts.rows.map(row => ({ batch: row.batch, status: row.status })),
+      [1, 2, 3].map(batch => ({ batch, status: 'failed' })));
+    for (const row of attempts.rows) assert.match(row.error_message, /Unsupported orders schema/);
+    assert.equal((await worker.query("SELECT count(*)::int AS n FROM pipeline.ingest_attempts WHERE status='running'")).rows[0].n, 0);
+  } finally {
+    await holder.query('ROLLBACK');
+    holder.release();
+    await pending;
+    await worker.end();
+  }
+});
+
 test('ingestion waits beyond session timeouts for tenant serialization and restores them', async () => {
   const worker = new pg.Pool({ connectionString: urls[northwind.databaseUrlEnv]!, max: 2,
     application_name: 'e76-lock-test', options: '-c lock_timeout=50 -c statement_timeout=150' });

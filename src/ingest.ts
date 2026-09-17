@@ -15,6 +15,7 @@ export async function ingestBytes(pool: pg.Pool, tenant: Tenant, batch: Batch, b
   const attempt = randomUUID();
   await pool.query('INSERT INTO pipeline.ingest_attempts(attempt_id,tenant_id,source,batch,file_hash,status) VALUES($1,$2,$3,$4,$5,\'running\')', [attempt, tenant.id, batch.source, batch.batch, hash]);
   const client = await pool.connect();
+  let released = false;
   try {
     await client.query('BEGIN');
     const timeouts = await client.query<{ lock_timeout: string; statement_timeout: string }>("SELECT current_setting('lock_timeout') AS lock_timeout,current_setting('statement_timeout') AS statement_timeout");
@@ -47,10 +48,13 @@ export async function ingestBytes(pool: pg.Pool, tenant: Tenant, batch: Batch, b
     return result;
   } catch (error) {
     await client.query('ROLLBACK');
+    // Return the transaction connection before the separate failure-journal update.
+    client.release();
+    released = true;
     const message = error instanceof Error ? error.message : 'Unknown ingestion failure';
     await pool.query("UPDATE pipeline.ingest_attempts SET status='failed',finished_at=clock_timestamp(),error_code='INGEST_FAILED',error_message=$2 WHERE attempt_id=$1", [attempt, message.slice(0, 1000)]);
     throw error;
-  } finally { client.release(); }
+  } finally { if (!released) client.release(); }
 }
 
 async function insertCanonical(client: pg.PoolClient, tenant: string, source: string, hash: string, row: number, value: Canonical): Promise<number> {

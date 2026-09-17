@@ -68,7 +68,7 @@ npm run report -- --tenant lumen
 
 A file's raw rows, staging changes, and success receipt commit together. A crash before commit requires replaying that file; a crash after commit is a harmless retry. File fingerprints prevent repeat delivery from duplicating raw storage, while tenant-scoped business keys prevent overlapping exports from duplicating reporting records. Changed canonical values for an existing key fail rather than silently overwriting history. An already processed batch arriving with different bytes also fails. Exact replay requires the same tenant, source, batch, and bytes. Identical bytes assigned to another expected batch fail visibly without creating its receipt or closing its coverage.
 
-An attempt journal is separate from that publication transaction, so failed attempts remain visible. A killed process can leave a `running` entry; a subsequent successful retry marks the interrupted attempt `abandoned`. There is no automatic stuck-run watchdog. Same-tenant ingestion waits for the serialization lock without a lock or statement timeout; both session limits are restored immediately after acquisition. A stalled holder therefore requires operator investigation or cancellation. Missing files are printed as `missing`; status retains the expected batch as `pending` with `file_present: false`.
+An attempt journal is separate from that publication transaction, so failed attempts remain visible. After rollback, failed-ingest journaling releases the transaction connection before its separate update so a saturated worker pool does not strand attempts. A killed process can leave a `running` entry; a subsequent successful retry marks the interrupted attempt `abandoned`. There is no automatic stuck-run watchdog. Same-tenant ingestion waits for the serialization lock without a lock or statement timeout; both session limits are restored immediately after acquisition. A stalled holder therefore requires operator investigation or cancellation. Missing files are printed as `missing`; status retains the expected batch as `pending` with `file_present: false`.
 
 Correct invalid input in an unprocessed batch and rerun it. Existing tenant configuration is frozen after provisioning: changing a mapping requires an explicit data migration, not a blind replay. That migration workflow is not implemented. A missing expected file remains missing until it is supplied and successfully processed. Do not “repair” gaps by creating empty files or deleting manifest entries. Setup rejects removal of persisted expectations. Ingest, status, and report reconcile the complete selected tenant manifest against persisted expectations before processing, even with source/batch filters or when setup was skipped. Restore removed or changed entries; provision additive tenants and batches with `npm run db:setup`.
 
@@ -124,4 +124,10 @@ The tests cover source contracts, replay/overlap, concurrent delivery, changed-r
 
 The implementation focuses on transactional replay, overlapping-export deduplication, tenant-scoped models/access, known schema drift, late-event reporting, and manifest-based coverage. It deliberately omits production scheduling, external alerts, chunk checkpoints, correction workflows, historical report snapshots, FX, attribution, and production secret/backup operations.
 
-Read [TRADEOFFS.md](TRADEOFFS.md) for the rationale and next-week priorities. [The walkthrough script](docs/walkthrough.md) is a recording aid, **not a recorded walkthrough**. Recording, public repository publication, and portal submission are separate remaining steps; no video URL is fabricated here.
+Read [TRADEOFFS.md](TRADEOFFS.md) for the rationale and next-week priorities. [The walkthrough script](docs/walkthrough.md) is a recording aid, **not a recorded walkthrough**.
+
+Before submission:
+
+- Verify that the repository is publicly accessible without authentication, using a signed-out browser session.
+- Record the walkthrough and provide its real, accessible link in the submission; the script is not a substitute.
+- Verify both links before submitting them through the portal.
