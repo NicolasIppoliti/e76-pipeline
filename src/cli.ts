@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { loadConfig, loadManifest, safeFixturePath, SOURCES, type Batch, type Tenant } from './config.js';
-import { assertWorkerIdentity, database, setup } from './db.js';
+import { assertTenantManifest, assertWorkerIdentity, database, setup } from './db.js';
 import { ingestBytes } from './ingest.js';
 
 const HELP = `Batch pipeline (PostgreSQL 15+, Node.js 22+)
@@ -52,14 +52,15 @@ async function main(): Promise<void> {
     let batches = manifest.filter(b => b.tenant === tenant.id && (!values.source || b.source === values.source) && (!values.batch || b.batch === Number(values.batch)));
     if (!batches.length) throw new Error(`No expected batches match ${tenant.id}`);
     if (values.reverse) batches = batches.reverse();
-    await runTenant(command!, tenant, batches, root);
+    await runTenant(command!, tenant, batches, root, manifest);
   }
 }
 
-async function runTenant(command: string, tenant: Tenant, batches: Batch[], root: string): Promise<void> {
+async function runTenant(command: string, tenant: Tenant, batches: Batch[], root: string, manifest: Batch[]): Promise<void> {
   const worker = database(requiredEnv(tenant.databaseUrlEnv));
   try {
     await assertWorkerIdentity(worker, tenant);
+    await assertTenantManifest(worker, tenant, manifest);
     if (command === 'ingest') {
       let missing = false;
       for (const batch of batches) {

@@ -17,13 +17,18 @@ export async function ingestBytes(pool: pg.Pool, tenant: Tenant, batch: Batch, b
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const timeouts = await client.query<{ lock_timeout: string; statement_timeout: string }>("SELECT current_setting('lock_timeout') AS lock_timeout,current_setting('statement_timeout') AS statement_timeout");
+    // The serialization wait is unbounded; subsequent ingestion statements retain their limits.
+    await client.query("SET LOCAL lock_timeout='0'; SET LOCAL statement_timeout='0'");
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`e76-pipeline:${tenant.id}`]);
+    await client.query("SELECT set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true)", [timeouts.rows[0]!.lock_timeout, timeouts.rows[0]!.statement_timeout]);
     await client.query(`UPDATE pipeline.ingest_attempts SET status='abandoned', finished_at=clock_timestamp(), error_code='INTERRUPTED', error_message='Previous attempt ended without a committed receipt; retry is safe' WHERE tenant_id=$1 AND source=$2 AND batch=$3 AND status='running' AND attempt_id<>$4 AND started_at < (SELECT started_at FROM pipeline.ingest_attempts WHERE attempt_id=$4)`, [tenant.id, batch.source, batch.batch, attempt]);
     const receipt = await client.query('SELECT file_hash FROM pipeline.batch_receipts WHERE tenant_id=$1 AND source=$2 AND batch=$3', [tenant.id, batch.source, batch.batch]);
     if (receipt.rowCount && receipt.rows[0].file_hash !== hash) throw new Error('BATCH_CONFLICT: already processed batch has different bytes');
     const existing = await client.query('SELECT row_count,schema_version FROM pipeline.files WHERE tenant_id=$1 AND source=$2 AND file_hash=$3', [tenant.id, batch.source, hash]);
     let result: IngestResult;
     if (existing.rowCount) {
+      if (!receipt.rowCount) throw new Error('DUPLICATE_FILE: identical bytes already belong to another expected batch');
       result = { status: 'replayed', rows: existing.rows[0].row_count, inserted: 0, duplicates: existing.rows[0].row_count, hash, schemaVersion: existing.rows[0].schema_version };
     } else {
       if (bytes.length > 10 * 1024 * 1024) throw new Error('File exceeds the supported 10 MiB limit');

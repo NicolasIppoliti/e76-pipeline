@@ -18,6 +18,17 @@ export async function assertWorkerIdentity(pool: pg.Pool, tenant: Tenant): Promi
   }
 }
 
+/** Compare the complete tenant manifest before applying command filters. */
+export async function assertTenantManifest(pool: pg.Pool, tenant: Tenant, batches: Batch[]): Promise<void> {
+  const persisted = await pool.query<Batch>('SELECT tenant_id AS tenant,source,batch,path,covers_from::text,covers_to::text FROM pipeline.expected_batches WHERE tenant_id=$1', [tenant.id]);
+  const expected = batches.filter(batch => batch.tenant === tenant.id);
+  if (persisted.rows.length !== expected.length || persisted.rows.some(row => !expected.some(batch =>
+    batch.source === row.source && batch.batch === row.batch && batch.path === row.path &&
+    batch.covers_from === row.covers_from && batch.covers_to === row.covers_to))) {
+    throw new Error(`Manifest divergence for tenant ${tenant.id}; restore persisted entries and run db:setup for additions`);
+  }
+}
+
 const identifier = (value: string) => `"${value.replaceAll('"', '""')}"`;
 const literal = (value: string) => `'${value.replaceAll("'", "''")}'`;
 
@@ -68,6 +79,12 @@ export async function setup(pool: pg.Pool, config: Config, batches: Batch[], url
       await client.query(`GRANT SELECT, INSERT ON pipeline.files, pipeline.raw_records, pipeline.batch_receipts, pipeline.ingest_attempts, staging.orders, staging.email_events, staging.ad_spend TO ${role}`);
       await client.query(`GRANT UPDATE(status, finished_at, error_code, error_message) ON pipeline.ingest_attempts TO ${role}`);
       await client.query(`GRANT SELECT ON ALL TABLES IN SCHEMA reporting TO ${role}`);
+    }
+    const persisted = await client.query<{ tenant_id: string; source: string; batch: number }>('SELECT tenant_id,source,batch FROM pipeline.expected_batches');
+    for (const row of persisted.rows) {
+      if (!batches.some(batch => batch.tenant === row.tenant_id && batch.source === row.source && batch.batch === row.batch)) {
+        throw new Error(`Manifest batch removed: ${row.tenant_id}/${row.source}/${row.batch}; persisted expectations cannot be deleted`);
+      }
     }
     for (const batch of batches) {
       const params = [batch.tenant, batch.source, batch.batch, batch.path, batch.covers_from, batch.covers_to];

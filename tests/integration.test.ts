@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
+import pg from 'pg';
 import { database, setup } from '../src/db.js';
 import { loadConfig, loadManifest } from '../src/config.js';
 import { ingestBytes } from '../src/ingest.js';
@@ -118,19 +119,47 @@ test('same business key with changed payload rolls back all rows and records a v
   await assert.rejects(ingestBytes(pool, northwind, fixtureBatch('orders', 1), corrupt), /BATCH_CONFLICT/);
 });
 
-test('identical bytes can fulfil two expected batches without duplicating raw files', async () => {
+test('identical bytes cannot close another expected batch', async () => {
   const bytes = fixtureBytes('orders', 1);
   await ingestBytes(pool, northwind, fixtureBatch('orders', 1), bytes);
-  const second = await ingestBytes(pool, northwind, fixtureBatch('orders', 2), bytes);
-  assert.equal(second.status, 'replayed');
+  await assert.rejects(ingestBytes(pool, northwind, fixtureBatch('orders', 2), bytes), /DUPLICATE_FILE/);
+  const status = await pool.query("SELECT status,latest_attempt_status FROM reporting.batch_status WHERE source='orders' AND batch=2");
+  assert.deepEqual(status.rows, [{ status: 'pending', latest_attempt_status: 'failed' }]);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM pipeline.files')).rows[0].n, 1);
-  assert.equal((await pool.query('SELECT count(*)::int AS n FROM pipeline.batch_receipts')).rows[0].n, 2);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM pipeline.batch_receipts')).rows[0].n, 1);
 });
 
 test('concurrent delivery serializes safely without duplicates', async () => {
   const results = await Promise.all([1, 2].map(() => ingestBytes(pool, northwind, fixtureBatch('orders', 1), fixtureBytes('orders', 1))));
   assert.deepEqual(results.map(r => r.status).sort(), ['processed', 'replayed']);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM pipeline.files')).rows[0].n, 1);
+});
+
+test('ingestion waits beyond session timeouts for tenant serialization and restores them', async () => {
+  const worker = new pg.Pool({ connectionString: urls[northwind.databaseUrlEnv]!, max: 2,
+    application_name: 'e76-lock-test', options: '-c lock_timeout=50 -c statement_timeout=150' });
+  const holder = await admin.connect();
+  try {
+    await holder.query('BEGIN');
+    await holder.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`e76-pipeline:${northwind.id}`]);
+    const pending = ingestBytes(worker, northwind, fixtureBatch('orders', 1), fixtureBytes('orders', 1)).catch((error: unknown) => error);
+    try {
+      let waiting = false;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const state = await admin.query("SELECT 1 FROM pg_stat_activity WHERE application_name='e76-lock-test' AND wait_event='advisory'");
+        if (state.rowCount) { waiting = true; break; }
+        await delay(5);
+      }
+      assert.ok(waiting, 'ingestion must reach the held serialization lock');
+      await delay(200);
+    } finally { await holder.query('ROLLBACK'); }
+    const result = await pending;
+    if (result instanceof Error) throw result;
+    assert.equal((result as { status: string }).status, 'processed');
+    assert.deepEqual((await worker.query("SELECT status,latest_attempt_status FROM reporting.batch_status WHERE source='orders' AND batch=1")).rows, [{ status: 'processed', latest_attempt_status: 'processed' }]);
+    assert.equal((await worker.query('SHOW lock_timeout')).rows[0].lock_timeout, '50ms');
+    assert.equal((await worker.query('SHOW statement_timeout')).rows[0].statement_timeout, '150ms');
+  } finally { await holder.query('ROLLBACK'); holder.release(); await worker.end(); }
 });
 
 test('tenant login policies isolate raw, canonical, control and reporting data without app filters', async () => {
@@ -164,6 +193,13 @@ test('tenant login policies isolate raw, canonical, control and reporting data w
     assert.notEqual(nw.rows[0].amount, lu.rows[0].amount);
     assert.equal((await admin.query('SELECT count(*)::int AS n FROM staging.ad_spend')).rows[0].n, 36);
   } finally { await other.end(); }
+});
+
+test('setup rejects deleting a persisted expected batch without hiding its coverage', async () => {
+  const removed = fixtureBatch('ad_spend', 3, 'lumen');
+  await assert.rejects(setup(admin, config, manifest.filter(batch => batch !== removed), urls), /Manifest.*(removed|divergence)/);
+  const status = await admin.query("SELECT status FROM reporting.batch_status WHERE tenant_id='lumen' AND source='ad_spend' AND batch=3");
+  assert.deepEqual(status.rows, [{ status: 'pending' }]);
 });
 
 test('a third tenant is provisioned from configuration and reuses all three source models', async () => {
@@ -254,4 +290,22 @@ test('invalid source schema fails visibly without a partial file or successful r
 test('runtime rejects administrative credentials before creating tenant metadata', async () => {
   await assert.rejects(ingestBytes(admin, northwind, fixtureBatch('orders', 1), fixtureBytes('orders', 1)), /Worker identity/);
   assert.equal((await admin.query('SELECT count(*)::int AS n FROM pipeline.ingest_attempts')).rows[0].n, 0);
+});
+
+test('runtime commands reject a deleted manifest entry even outside their selected source and batch', async () => {
+  // Simulate an established expectation that the current on-disk manifest no longer contains.
+  await admin.query("INSERT INTO pipeline.expected_batches SELECT tenant_id,source,99,'northwind/ad_spend/batch_99.csv',covers_from,covers_to FROM pipeline.expected_batches WHERE tenant_id='northwind' AND source='ad_spend' AND batch=1");
+  for (const command of ['status', 'ingest', 'report']) {
+    const filters = command === 'report' ? [] : ['--source', 'orders', '--batch', '1'];
+    const child = spawn(process.execPath, ['--import', 'tsx', 'src/cli.ts', command, '--tenant', 'northwind', ...filters], { env: { ...process.env, ...urls }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = ''; let stdout = '';
+    child.stderr.on('data', chunk => { stderr += String(chunk); });
+    child.stdout.on('data', chunk => { stdout += String(chunk); });
+    const code = await new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+    assert.equal(code, 1, `${command}: ${stdout} ${stderr}`);
+    assert.match(stderr, /Manifest divergence/, command);
+    assert.equal(stdout, '', command);
+  }
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM pipeline.ingest_attempts')).rows[0].n, 0);
+  assert.deepEqual((await pool.query("SELECT status FROM reporting.batch_status WHERE source='ad_spend' AND batch=99")).rows, [{ status: 'pending' }]);
 });

@@ -17,15 +17,15 @@ See [fixture evidence](docs/fixture-audit.md).
 | Decision | Why | Cost / boundary |
 |---|---|---|
 | One transaction per file, including raw rows, staging, and success receipt | An interrupted file is either published completely or not at all | Retry the entire file; no resumable chunk checkpoints. Files are buffered in memory, and inputs above 10 MiB are rejected before parsing. This is not a design for multi-gigabyte exports |
-| Serialize ingestion within each tenant | Concurrent retries cannot race through the publication boundary | Simpler correctness at the cost of per-tenant throughput; different tenants use different locks |
-| File identity plus tenant-scoped business keys | A byte-identical file replay and overlapping exports are different problems | Raw provenance can include repeated business records, while staging and reports count each business key once |
+| Serialize ingestion within each tenant | Concurrent retries cannot race through the publication boundary | Simpler correctness at the cost of per-tenant throughput; different tenants use different locks. Lock acquisition waits without lock/statement timeouts, restoring limits immediately afterward; a stalled holder needs operator intervention |
+| File identity plus tenant-scoped business keys | Exact replay is bound to the same tenant/source/batch receipt and hash; identical bytes cannot satisfy another expected batch | Raw provenance can include repeated business records, while staging and reports count each business key once |
 | Reject changed canonical values for an existing business key, or different bytes for a processed batch | A retry must not silently become an undocumented correction | Legitimate amendments need an explicit correction/version policy; that workflow is deferred |
 | Freeze an existing tenant's configuration after provisioning | Replaying a previously accepted file must not silently reinterpret it under new mappings | Changing established mappings requires an explicit data migration; automatic remodelling is deferred |
 | One shared schema with tenant-scoped keys and restricted database roles | One model serves every tenant, with isolation below application filters | Privileged administrators and the provisioning path remain trusted; RLS is not protection against a database administrator |
 | Daily SQL views over staging | Late events naturally restate their event dates without backfill jobs | These are current corrected results, not historical snapshots of what a dashboard showed yesterday |
 | Explicit known schema versions; reject unexpected shapes | The supplied rename is handled deliberately and remains observable | New source contracts require adapter work; configuration-only onboarding applies to supported contracts |
 | Separate orders, email events, and ad reports | Each has a defensible grain and metric | No speculative cross-source attribution or joined ROAS |
-| Manifest-based coverage status | Missing expected batches are visible even after newer arrivals | This proves a coverage gap, not a breach of an unprovided delivery deadline |
+| Manifest-based coverage status | Missing expected batches are visible even after newer arrivals | Setup rejects deletion of persisted expectations; runtime commands reject full tenant-manifest divergence even with filters. Additions require setup. This proves a coverage gap, not a breach of an unprovided delivery deadline |
 
 ## What the numbers mean
 
