@@ -76,7 +76,7 @@ export async function setup(pool: pg.Pool, config: Config, batches: Batch[], url
       const role = identifier(tenant.role);
       await client.query(`GRANT USAGE ON SCHEMA pipeline, staging, reporting TO ${role}`);
       await client.query(`GRANT SELECT ON pipeline.tenants, pipeline.expected_batches TO ${role}`);
-      await client.query(`GRANT SELECT, INSERT ON pipeline.files, pipeline.raw_records, pipeline.batch_receipts, pipeline.ingest_attempts, staging.orders, staging.email_events, staging.ad_spend TO ${role}`);
+      await client.query(`GRANT SELECT, INSERT ON pipeline.files, pipeline.raw_records, pipeline.order_quarantine, pipeline.batch_receipts, pipeline.ingest_attempts, staging.orders, staging.email_events, staging.ad_spend TO ${role}`);
       await client.query(`GRANT UPDATE(status, finished_at, error_code, error_message) ON pipeline.ingest_attempts TO ${role}`);
       await client.query(`GRANT SELECT ON ALL TABLES IN SCHEMA reporting TO ${role}`);
     }

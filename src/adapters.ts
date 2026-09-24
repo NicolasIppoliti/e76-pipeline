@@ -13,7 +13,8 @@ export interface AdSpend {
 }
 export type Canonical = Order | EmailEvent | AdSpend;
 export interface ParsedRow { canonical: Canonical; rawText: string; lineStart: number; lineEnd: number }
-export interface ParsedBatch { schemaVersion: string; rows: ParsedRow[] }
+export interface RejectedOrder { rawText: string; lineStart: number; lineEnd: number; reason: string }
+export interface ParsedBatch { schemaVersion: string; rows: ParsedRow[]; rejected: RejectedOrder[] }
 interface CsvRecord { record: string[]; raw: string; info: { lines: number } }
 
 const text = z.string().min(1).max(500);
@@ -49,11 +50,14 @@ export function parseBatch(source: Source, bytes: Buffer, tenant: Tenant): Parse
   if (!header) throw new Error('Empty file');
   const physicalLines = input.match(/[^\r\n]*(?:\r\n|\n|\r|$)/g) ?? [];
   let previousLine = header.info.lines;
-  const rows = records.map(row => {
+  const rejected: RejectedOrder[] = [];
+  const rows = records.flatMap(row => {
     const record = Object.fromEntries(header.record.map((key, i) => [key, row.record[i]]));
     let canonical: Canonical;
     try {
       if (source === 'orders') {
+        if (tenant.id === 'northwind' && typeof record['order_id'] === 'string' && record['order_id'].trim() === '')
+          throw new Error('order_id: Blank order ID');
         const value = orderSchema.parse(record);
         if (!tenant.orderCurrencies.includes(value.currency)) throw new Error(`Unconfigured order currency: ${value.currency}`);
         canonical = {
@@ -67,12 +71,27 @@ export function parseBatch(source: Source, bytes: Buffer, tenant: Tenant): Parse
           amount: 'spend' in value ? value.spend : value.cost_usd, currency: 'spend' in value ? 'UNKNOWN' : 'USD',
         };
       }
-    } catch (error) { throw new Error(`Line ${previousLine + 1}: ${safeValidationMessage(error)}`); }
+    } catch (error) {
+      const blankId = typeof record['order_id'] === 'string' && record['order_id'].trim() === '';
+      const negativeGross = typeof record['gross'] === 'string' && /^-\d/.test(record['gross']);
+      const unconfiguredCurrency = typeof record['currency'] === 'string' &&
+        !tenant.orderCurrencies.includes(record['currency']);
+      const reason = tenant.id === 'northwind' && source === 'orders' && blankId
+        ? 'order_id: Blank order ID'
+        : tenant.id === 'northwind' && source === 'orders' && unconfiguredCurrency
+          ? `Unconfigured order currency: ${record['currency']}`
+          : safeValidationMessage(error);
+      if (source !== 'orders' || tenant.id !== 'northwind' || !(blankId || negativeGross || unconfiguredCurrency))
+        throw new Error(`Line ${previousLine + 1}: ${reason}`);
+      rejected.push({ rawText: physicalLines.slice(previousLine, row.info.lines).join(''), lineStart: previousLine + 1, lineEnd: row.info.lines, reason });
+      previousLine = row.info.lines;
+      return [];
+    }
     const result = { canonical, rawText: physicalLines.slice(previousLine, row.info.lines).join(''), lineStart: previousLine + 1, lineEnd: row.info.lines };
     previousLine = row.info.lines;
-    return result;
+    return [result];
   });
-  return { schemaVersion, rows };
+  return { schemaVersion, rows, rejected };
 }
 
 // Validation diagnostics identify fields, not customer values or complete payloads.
@@ -98,5 +117,5 @@ function parseEmail(input: string, tenant: Tenant): ParsedBatch {
     }
   });
   if (!rows.length) throw new Error('Empty email_events file');
-  return { schemaVersion: 'email_events.v1', rows };
+  return { schemaVersion: 'email_events.v1', rows, rejected: [] };
 }

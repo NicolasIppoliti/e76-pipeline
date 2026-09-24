@@ -26,21 +26,27 @@ export async function ingestBytes(pool: pg.Pool, tenant: Tenant, batch: Batch, b
     await client.query(`UPDATE pipeline.ingest_attempts SET status='abandoned', finished_at=clock_timestamp(), error_code='INTERRUPTED', error_message='Previous attempt ended without a committed receipt; retry is safe' WHERE tenant_id=$1 AND source=$2 AND batch=$3 AND status='running' AND attempt_id<>$4 AND started_at < (SELECT started_at FROM pipeline.ingest_attempts WHERE attempt_id=$4)`, [tenant.id, batch.source, batch.batch, attempt]);
     const receipt = await client.query('SELECT file_hash FROM pipeline.batch_receipts WHERE tenant_id=$1 AND source=$2 AND batch=$3', [tenant.id, batch.source, batch.batch]);
     if (receipt.rowCount && receipt.rows[0].file_hash !== hash) throw new Error('BATCH_CONFLICT: already processed batch has different bytes');
-    const existing = await client.query('SELECT row_count,schema_version FROM pipeline.files WHERE tenant_id=$1 AND source=$2 AND file_hash=$3', [tenant.id, batch.source, hash]);
+    const existing = await client.query('SELECT row_count,rejected_count,schema_version FROM pipeline.files WHERE tenant_id=$1 AND source=$2 AND file_hash=$3', [tenant.id, batch.source, hash]);
     let result: IngestResult;
     if (existing.rowCount) {
       if (!receipt.rowCount) throw new Error('DUPLICATE_FILE: identical bytes already belong to another expected batch');
-      result = { status: 'replayed', rows: existing.rows[0].row_count, inserted: 0, duplicates: existing.rows[0].row_count, hash, schemaVersion: existing.rows[0].schema_version };
+      result = { status: 'replayed', rows: existing.rows[0].row_count, inserted: 0, duplicates: existing.rows[0].row_count - existing.rows[0].rejected_count, hash, schemaVersion: existing.rows[0].schema_version };
     } else {
       if (bytes.length > 10 * 1024 * 1024) throw new Error('File exceeds the supported 10 MiB limit');
       const parsed = parseBatch(batch.source, bytes, tenant);
       let inserted = 0;
-      for (const [index, row] of parsed.rows.entries()) {
-        await client.query('INSERT INTO pipeline.raw_records VALUES($1,$2,$3,$4,$5,$6,$7)', [tenant.id, batch.source, hash, index + 1, row.lineStart, row.lineEnd, row.rawText]);
-        inserted += await insertCanonical(client, tenant.id, batch.source, hash, index + 1, row.canonical);
+      const records = [
+        ...parsed.rows.map(row => ({ ...row, reason: null as string | null })),
+        ...parsed.rejected.map(row => ({ ...row, canonical: null as Canonical | null })),
+      ].sort((a, b) => a.lineStart - b.lineStart);
+      for (const [index, row] of records.entries()) {
+        const rowNumber = index + 1;
+        await client.query('INSERT INTO pipeline.raw_records VALUES($1,$2,$3,$4,$5,$6,$7)', [tenant.id, batch.source, hash, rowNumber, row.lineStart, row.lineEnd, row.rawText]);
+        if (row.canonical) inserted += await insertCanonical(client, tenant.id, batch.source, hash, rowNumber, row.canonical);
+        else await client.query('INSERT INTO pipeline.order_quarantine(tenant_id,file_hash,row_number,source_file,line_number,reason) VALUES($1,$2,$3,$4,$5,$6)', [tenant.id, hash, rowNumber, batch.path, row.lineStart, row.reason]);
       }
-      result = { status: 'processed', rows: parsed.rows.length, inserted, duplicates: parsed.rows.length - inserted, hash, schemaVersion: parsed.schemaVersion };
-      await client.query('INSERT INTO pipeline.files(tenant_id,source,file_hash,body,schema_version,config_hash,row_count,inserted_count,duplicate_count) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)', [tenant.id, batch.source, hash, bytes, parsed.schemaVersion, configHash(tenant), result.rows, inserted, result.duplicates]);
+      result = { status: 'processed', rows: records.length, inserted, duplicates: records.length - inserted - parsed.rejected.length, hash, schemaVersion: parsed.schemaVersion };
+      await client.query('INSERT INTO pipeline.files(tenant_id,source,file_hash,body,schema_version,config_hash,row_count,inserted_count,duplicate_count,rejected_count) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)', [tenant.id, batch.source, hash, bytes, parsed.schemaVersion, configHash(tenant), result.rows, inserted, result.duplicates, parsed.rejected.length]);
     }
     await client.query('INSERT INTO pipeline.batch_receipts(tenant_id,source,batch,file_hash) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING', [tenant.id, batch.source, batch.batch, hash]);
     await client.query('UPDATE pipeline.ingest_attempts SET status=$2,finished_at=clock_timestamp() WHERE attempt_id=$1', [attempt, result.status]);
