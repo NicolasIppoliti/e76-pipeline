@@ -1,0 +1,5 @@
+order_id,created_at,channel,gross,currency,customer_email
+NO-LIVE-1,2026-02-05T10:00:00Z,google,45.00,USD,c1@example.invalid
+NO-LIVE-2,2026-02-05T10:05:00Z,google,-12.50,USD,c2@example.invalid
+,2026-02-05T10:10:00Z,email,30.00,USD,c3@example.invalid
+NO-LIVE-4,2026-02-05T10:15:00Z,direct,60.00,EUR,c4@example.invalid

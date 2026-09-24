@@ -42,6 +42,52 @@ test('a restricted tenant connection atomically ingests and exactly replays an o
   assert.equal(files.rows[0].n, 1);
 });
 
+const northwindMixedOrderTracer = async () => {
+  const batch = { ...fixtureBatch('orders', 5), batch: 6, path: 'northwind/orders/batch_06.csv',
+    covers_from: '2026-02-05', covers_to: '2026-02-05' };
+  await admin.query('INSERT INTO pipeline.expected_batches(tenant_id,source,batch,path,covers_from,covers_to) VALUES($1,$2,$3,$4,$5,$6)',
+    [batch.tenant, batch.source, batch.batch, batch.path, batch.covers_from, batch.covers_to]);
+  const bytes = readFileSync(`fixtures/${batch.path}`);
+  const snapshot = async () => ({
+    orders: (await pool.query("SELECT tenant_id,order_id,gross::text AS gross,currency FROM staging.orders ORDER BY order_id")).rows,
+    rejected: (await pool.query(
+      'SELECT tenant_id,source_file,line_number,reason FROM pipeline.order_quarantine ORDER BY line_number')).rows,
+  });
+  const first = await ingestBytes(pool, northwind, batch, bytes);
+  assert.equal(first.status, 'processed');
+  assert.equal(first.inserted, 1);
+  assert.equal(first.duplicates, 0);
+  const counts = await pool.query('SELECT row_count,inserted_count,duplicate_count,rejected_count FROM pipeline.files WHERE tenant_id=$1 AND source=$2', [batch.tenant, batch.source]);
+  assert.deepEqual(counts.rows, [{ row_count: 4, inserted_count: 1, duplicate_count: 0, rejected_count: 3 }]);
+  const batchStatus = await pool.query("SELECT row_count,inserted_count,duplicate_count,rejected_count FROM reporting.batch_status WHERE source='orders' AND batch=6");
+  assert.deepEqual(batchStatus.rows, [{ row_count: 4, inserted_count: 1, duplicate_count: 0, rejected_count: 3 }]);
+  const reporting = await pool.query("SELECT sum(order_count)::int AS n FROM reporting.daily_orders WHERE date='2026-02-05'");
+  assert.equal(reporting.rows[0].n, 1);
+  const initial = await snapshot();
+  assert.deepEqual(initial.orders, [{ tenant_id: 'northwind', order_id: 'NO-LIVE-1', gross: '45.00', currency: 'USD' }]);
+  assert.equal(initial.rejected.length, 3);
+  const lumen = config.tenants[1]!;
+  const lumenWorker = database(urls[lumen.databaseUrlEnv]!);
+  try {
+    assert.equal((await lumenWorker.query('SELECT count(*)::int AS n FROM pipeline.order_quarantine')).rows[0].n, 0);
+  } finally { await lumenWorker.end(); }
+  assert.deepEqual(initial.rejected.map(row => row.line_number), [3, 4, 5]);
+  for (const row of initial.rejected) {
+    assert.equal(row.tenant_id, 'northwind');
+    assert.equal(row.source_file, batch.path);
+    assert.ok(typeof row.reason === 'string' && row.reason.length > 0);
+  }
+  assert.match(initial.rejected[0].reason, /negative|gross/i);
+  assert.match(initial.rejected[1].reason, /blank|missing|order.id/i);
+  assert.match(initial.rejected[2].reason, /currency|EUR/i);
+  assert.equal(new Set(initial.rejected.map(row => row.reason)).size, 3);
+  const second = await ingestBytes(pool, northwind, batch, bytes);
+  assert.equal(second.status, 'replayed');
+  assert.equal(second.duplicates, 1);
+  assert.deepEqual(await snapshot(), initial);
+  assert.deepEqual((await pool.query('SELECT row_count,inserted_count,duplicate_count,rejected_count FROM pipeline.files WHERE tenant_id=$1 AND source=$2', [batch.tenant, batch.source])).rows, counts.rows);
+};
+
 test('overlapping order exports retain 680 unique orders and exact gross', async () => {
   for (const batch of manifest.filter(b => b.tenant === 'northwind' && b.source === 'orders')) {
     await ingestBytes(pool, northwind, batch, readFileSync(`fixtures/${batch.path}`));
@@ -300,27 +346,18 @@ test('SIGKILL one third through a file rolls back partial work; full retry equal
     await admin.query('DROP TRIGGER test_pause ON staging.orders; DROP FUNCTION pipeline.test_pause()');
   }
   const ingestAll = async () => {
-    for (const tenant of config.tenants) {
-      const worker = tenant.id === northwind.id ? pool : database(urls[tenant.databaseUrlEnv]!);
-      try {
-        for (const batch of manifest.filter(b => b.tenant === tenant.id)) {
-          const path = `fixtures/${batch.path}`;
-          if (existsSync(path)) await ingestBytes(worker, tenant, batch, readFileSync(path));
-        }
-      } finally { if (worker !== pool) await worker.end(); }
-    }
+    for (const batch of [1, 2, 3]) await ingestBytes(pool, northwind, fixtureBatch('orders', batch), fixtureBytes('orders', batch));
   };
-  const snapshot = async () => {
-    const result: Record<string, unknown> = {};
-    for (const table of ['orders', 'email_events', 'ad_spend']) result[table] = (await admin.query(`SELECT tenant_id,canonical_payload FROM staging.${table} ORDER BY tenant_id,canonical_payload::text`)).rows;
-    return result;
-  };
+  const snapshot = async () =>
+    (await admin.query('SELECT tenant_id,canonical_payload FROM staging.orders ORDER BY tenant_id,canonical_payload::text')).rows;
   await ingestAll();
   const retried = await snapshot();
   assert.equal((await pool.query("SELECT count(*)::int AS n FROM pipeline.ingest_attempts WHERE status='abandoned'")).rows[0].n, 1);
   const totals = await admin.query('SELECT count(*)::int AS files, sum(row_count)::int AS rows FROM pipeline.files');
-  assert.deepEqual(totals.rows[0], { files: 29, rows: 4498 });
-  assert.equal((await admin.query('SELECT count(*)::int AS n FROM staging.orders')).rows[0].n, 1342);
+  assert.deepEqual(totals.rows[0], { files: 3, rows: 411 });
+  assert.equal((await admin.query('SELECT count(*)::int AS n FROM staging.orders')).rows[0].n, 397);
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM pipeline.batch_receipts WHERE source='orders' AND batch=3")).rows[0].n, 1);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM pipeline.raw_records WHERE file_hash=$1', [(await import('../src/db.js')).sha256(fixtureBytes('orders', 3))])).rows[0].n, 146);
   await admin.query('TRUNCATE pipeline.files, pipeline.ingest_attempts CASCADE');
   await ingestAll();
   assert.deepEqual(await snapshot(), retried);
@@ -354,4 +391,46 @@ test('runtime commands reject a deleted manifest entry even outside their select
   }
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM pipeline.ingest_attempts')).rows[0].n, 0);
   assert.deepEqual((await pool.query("SELECT status FROM reporting.batch_status WHERE source='ad_spend' AND batch=99")).rows, [{ status: 'pending' }]);
+});
+
+test('Northwind whitespace order ID and lowercase currency quarantine with field reasons', async () => {
+  const batch = { ...fixtureBatch('orders', 5), batch: 7, path: 'northwind/orders/edge_batch_07.csv',
+    covers_from: '2026-02-05', covers_to: '2026-02-05' };
+  await admin.query('INSERT INTO pipeline.expected_batches(tenant_id,source,batch,path,covers_from,covers_to) VALUES($1,$2,$3,$4,$5,$6)',
+    [batch.tenant, batch.source, batch.batch, batch.path, batch.covers_from, batch.covers_to]);
+  const bytes = Buffer.from('order_id,created_at,channel,gross,currency,customer_email\n' +
+    'NO-EDGE-1,2026-02-05T00:00:00Z,direct,45.00,USD,edge@example.com\n' +
+    '   ,2026-02-05T00:00:00Z,direct,10.00,USD,edge@example.com\n' +
+    'NO-EDGE-2,2026-02-05T00:00:00Z,direct,10.00,eur,edge@example.com\n');
+  const result = await ingestBytes(pool, northwind, batch, bytes);
+  assert.equal(result.status, 'processed');
+  assert.equal(result.inserted, 1);
+  const orders = await pool.query('SELECT order_id FROM staging.orders');
+  assert.deepEqual(orders.rows, [{ order_id: 'NO-EDGE-1' }]);
+  const rejected = await pool.query('SELECT line_number,reason FROM pipeline.order_quarantine ORDER BY line_number');
+  assert.deepEqual(rejected.rows.map(row => row.line_number), [3, 4]);
+  assert.match(rejected.rows[0].reason, /order.id/i);
+  assert.match(rejected.rows[1].reason, /currency/i);
+  assert.deepEqual((await pool.query('SELECT row_count,inserted_count,rejected_count FROM pipeline.files')).rows,
+    [{ row_count: 3, inserted_count: 1, rejected_count: 2 }]);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM pipeline.batch_receipts WHERE batch=7')).rows[0].n, 1);
+});
+
+test('Northwind mixed order file quarantines invalid physical rows and replays exactly', northwindMixedOrderTracer);
+
+test('Lumen invalid order fails atomically without quarantine', async () => {
+  const lumen = config.tenants[1]!;
+  const worker = database(urls[lumen.databaseUrlEnv]!);
+  const batch = fixtureBatch('orders', 1, 'lumen');
+  const bytes = fixtureBytes('orders', 1, 'lumen');
+  const lines = bytes.toString().split('\n');
+  const invalid = lines[1]!.split(',');
+  invalid[3] = '-1.00';
+  const payload = Buffer.from(`${lines[0]}\n${lines[1]}\n${invalid.join(',')}\n`);
+  try {
+    await assert.rejects(ingestBytes(worker, lumen, batch, payload));
+    assert.equal((await worker.query('SELECT count(*)::int AS n FROM staging.orders')).rows[0].n, 0);
+    assert.equal((await worker.query('SELECT count(*)::int AS n FROM pipeline.files')).rows[0].n, 0);
+    assert.equal((await worker.query('SELECT count(*)::int AS n FROM pipeline.order_quarantine')).rows[0].n, 0);
+  } finally { await worker.end(); }
 });
